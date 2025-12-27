@@ -1,0 +1,65 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seed-minio-terraform-cache
+  namespace: argo
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: seed
+          image: alpine:3.23
+          env:
+            - name: MINIO_ENDPOINT
+              value: http://minio.argo.svc.cluster.local:9000
+            - name: MINIO_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: my-minio-cred
+                  key: accesskey
+            - name: MINIO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: my-minio-cred
+                  key: secretkey
+          resources:
+            requests:
+              cpu: '100m'
+              memory: '256Mi'
+            limits:
+              cpu: '500m'
+              memory: '512Mi'
+          command: ['/bin/sh', '-c']
+          args:
+            - |
+              set -e
+              tar --version
+              wget https://dl.min.io/client/mc/release/linux-amd64/mc
+              chmod +x mc
+              mv mc /usr/local/bin/mc
+
+              mc --version
+
+              mc alias set myminio "$MINIO_ENDPOINT" "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY"
+
+              if ! mc ls myminio/repos >/dev/null 2>&1; then
+                echo "Bucket repos does not exist"
+                echo "Creating bucket repos..."
+                mc mb myminio/repos
+              fi
+
+              if ! mc stat myminio/repos/terraform-providers-cache.tar.gz >/dev/null 2>&1; then
+                echo "Seeding terraform provider cache (initial tar)..."
+
+                mkdir -p /tmp/providers-empty
+                touch /tmp/providers-empty/.keep
+
+                tar -czf /tmp/terraform-providers-cache.tar.gz \
+                  -C /tmp/providers-empty .keep
+
+                mc cp /tmp/terraform-providers-cache.tar.gz \
+                  myminio/repos/terraform-providers-cache.tar.gz
+              else
+                echo "terraform-providers-cache.tar.gz already exists"
+              fi
