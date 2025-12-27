@@ -1,0 +1,120 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: run-terragrunt
+  namespace: argo
+  annotations:
+    workflows.argoproj.io/title: '**Execute Terragrunt Commands**'
+    workflows.argoproj.io/description: |
+      With this workflow you can run terragrunt
+spec:
+  templates:
+    - name: run-terragrunt
+      inputs:
+        parameters:
+          - name: action
+            value: plan
+            enum: [plan, apply, destroy]
+          - name: workingDir
+          - name: extra_args
+            value: ''
+          - name: terraform_source_module_path
+        artifacts:
+          - name: terragrunt-repo
+            path: /repo
+            s3:
+              key: leonomano-doks-tg-infra/{{workflow.parameters.terragrunt_branch}}/{{workflow.parameters.terragrunt_commit}}/
+          - name: terraform-repo
+            path: /repo/modules
+            s3:
+              key: leonomano-doks-tf-modules/{{workflow.parameters.terraform_branch}}/{{workflow.parameters.terraform_commit}}/
+      outputs:
+        parameters:
+          - name: terragrunt_exit_code
+            valueFrom:
+              path: /tmp/terragrunt_exitcode.txt
+      script:
+        image: alpine/terragrunt
+        volumeMounts:
+          - name: terraform-provider-cache
+            mountPath: /tmp/terraform/providers
+          - name: workflow-data
+            mountPath: /kube
+        env:
+          - name: AWS_ACCESS_KEY_ID
+            valueFrom:
+              secretKeyRef:
+                name: leonomano-do-k8s-cluster-minikube-argowf-keys
+                key: access-key
+          - name: AWS_SECRET_ACCESS_KEY
+            valueFrom:
+              secretKeyRef:
+                name: leonomano-do-k8s-cluster-minikube-argowf-keys
+                key: secret-access-key
+          - name: AWS_REGION
+            value: us-east-1
+          - name: KUBECONFIG
+            value: /kube/config
+        workingDir: /repo/{{inputs.parameters.workingDir}}
+        command:
+          - bash
+          - -c
+        source: |
+          echo "TF_SOURCE_BRANCH={{workflow.parameters.terraform_branch}}"
+          TF_SOURCE_BRANCH={{workflow.parameters.terraform_branch}} \
+          TG_NO_COLOR={{workflow.parameters.tg_no_color}} \
+          terragrunt {{inputs.parameters.action}} \
+            --source /repo/modules//{{inputs.parameters.terraform_source_module_path}} \
+            --provider-cache \
+            --provider-cache-dir /tmp/terraform/providers/cache \
+            {{inputs.parameters.extra_args}}
+
+          exitcode=$?
+          echo "Terragrunt {{inputs.parameters.action}} exit code: $exitcode"
+          echo $exitcode > /tmp/terragrunt_exitcode.txt
+
+    - name: download-terraform-provider-cache
+      inputs:
+        artifacts:
+          - name: terraform-provider-cache-dir
+            path: /tmp/terraform/providers/cache.tgz
+            s3:
+              key: terraform-providers-cache.tar.gz
+            archive:
+              none: {}
+      script:
+        image: alpine:3.23
+        command: ['sh', '-c']
+        volumeMounts:
+          - name: terraform-provider-cache
+            mountPath: /tmp/terraform/providers
+        source: |
+          set -e
+          [ -f /tmp/terraform/providers/cache ] && rm -f /tmp/terraform/providers/cache
+          mkdir -p /tmp/terraform/providers/cache
+          if [ -s /tmp/terraform/providers/cache.tgz ]; then
+            tar -xzf /tmp/terraform/providers/cache.tgz -C /tmp/terraform/providers/cache || true
+          fi
+          ls -hal /tmp/terraform/providers
+          ls -hal /tmp/terraform/providers/cache
+
+    - name: upload-terraform-provider-cache
+      outputs:
+        artifacts:
+          - name: terraform-provider-cache-dir
+            path: /tmp/cache.tgz
+            s3:
+              key: terraform-providers-cache.tar.gz
+            archive:
+              none: {}
+      script:
+        image: alpine:3.23
+        command: ['sh', '-c']
+        volumeMounts:
+          - name: terraform-provider-cache
+            mountPath: /tmp/terraform/providers
+        source: |
+          set -e
+          mkdir -p /tmp/terraform/providers/cache
+          tar -czf /tmp/cache.tgz -C /tmp/terraform/providers/cache .
+          ls -lah /tmp/cache.tgz

@@ -1,0 +1,97 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: destroy-do-kube-cluster-
+  namespace: argo
+  annotations:
+    workflows.argoproj.io/title: '**Decommision and Destroy Kubernetes Cluster**'
+    workflows.argoproj.io/description: |
+      With this workflow you destroy a Kubernetes Cluster in Digital Ocean
+      and deprovision it
+spec:
+  entrypoint: destroy-do-kube-cluster
+  onExit: exit-handler
+  ttlStrategy:
+    secondsAfterCompletion: 300
+  volumeClaimTemplates:
+    - metadata:
+        name: terraform-provider-cache
+      spec:
+        accessModes: ['ReadWriteOnce']
+        resources:
+          requests:
+            storage: 2Gi
+        storageClassName: standard
+  arguments:
+    parameters:
+      - name: environment
+        value: dev
+      - name: terragrunt_branch
+        value: main
+      - name: terragrunt_commit
+        value: latest
+      - name: terraform_branch
+        value: main
+      - name: terraform_commit
+        value: latest
+      - name: tg_no_color
+        value: 'true'
+        enum:
+          - 'true'
+          - 'false'
+      - name: tg_log_level
+        value: INFO
+        enum:
+          - ERROR
+          - WARN
+          - INFO
+          - DEBUG
+          - TRACE
+  templates:
+    - name: destroy-do-kube-cluster
+      dag:
+        tasks:
+          - name: download-terraform-provider-cache
+            templateRef:
+              name: run-terragrunt
+              template: download-terraform-provider-cache
+
+          - name: plan-destroy-k8s-configuration
+            depends: download-terraform-provider-cache.Succeeded
+            templateRef:
+              name: run-terragrunt
+              template: run-terragrunt
+            arguments:
+              parameters:
+                - name: action
+                  value: plan
+                - name: workingDir
+                  value: '{{workflow.parameters.environment}}/k8s-cluster'
+                - name: terraform_source_module_path
+                  value: k8s-cluster
+                - name: extra_args
+                  value: --destroy -detailed-exitcode
+
+          - name: destroy-k8s-configuration
+            depends: plan-destroy-k8s-configuration.Succeeded
+            when: '{{tasks.plan-destroy-k8s-configuration.outputs.parameters.terragrunt_exit_code}} == 2'
+            templateRef:
+              name: run-terragrunt
+              template: run-terragrunt
+            arguments:
+              parameters:
+                - name: action
+                  value: destroy
+                - name: workingDir
+                  value: '{{workflow.parameters.environment}}/k8s-cluster'
+                - name: terraform_source_module_path
+                  value: k8s-cluster
+                - name: extra_args
+                  value: --auto-approve
+
+    - name: exit-handler
+      steps:
+        - - name: upload-terraform-provider-cache
+            templateRef:
+              name: run-terragrunt
+              template: upload-terraform-provider-cache

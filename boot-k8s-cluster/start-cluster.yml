@@ -1,0 +1,199 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: deploy-do-kube-cluster-
+  namespace: argo
+  annotations:
+    workflows.argoproj.io/title: '**Bootstrap and Provision Kubernetes Cluster**'
+    workflows.argoproj.io/description: |
+      With this workflow you create a Kubernetes Cluster in Digital Ocean
+      and provision it with the following kube tools:
+        * external secrets operator
+        * external-dns
+        * cert-manager
+        * traefik
+spec:
+  entrypoint: deploy-do-kube-cluster
+  onExit: exit-handler
+  ttlStrategy:
+    secondsAfterCompletion: 300
+  volumeClaimTemplates:
+    - metadata:
+        name: terraform-provider-cache
+      spec:
+        accessModes: ['ReadWriteOnce']
+        resources:
+          requests:
+            storage: 2Gi
+        storageClassName: standard
+    - metadata:
+        name: workflow-data
+      spec:
+        accessModes: ['ReadWriteOnce']
+        resources:
+          requests:
+            storage: 500Mi
+        storageClassName: standard
+  arguments:
+    parameters:
+      - name: environment
+        value: dev
+      - name: terragrunt_branch
+        value: main
+      - name: terragrunt_commit
+        value: latest
+      - name: terraform_branch
+        value: main
+      - name: terraform_commit
+        value: latest
+      - name: tg_no_color
+        value: 'true'
+        enum:
+          - 'true'
+          - 'false'
+      - name: tg_log_level
+        value: INFO
+        enum:
+          - ERROR
+          - WARN
+          - INFO
+          - DEBUG
+          - TRACE
+  templates:
+    - name: deploy-do-kube-cluster
+      dag:
+        tasks:
+          - name: download-terraform-provider-cache
+            templateRef:
+              name: run-terragrunt
+              template: download-terraform-provider-cache
+
+          - name: check-changes-k8s-configuration
+            depends: download-terraform-provider-cache.Succeeded
+            templateRef:
+              name: run-terragrunt
+              template: run-terragrunt
+            arguments:
+              parameters:
+                - name: action
+                  value: plan
+                - name: workingDir
+                  value: '{{workflow.parameters.environment}}/k8s-cluster'
+                - name: terraform_source_module_path
+                  value: k8s-cluster
+                - name: extra_args
+                  value: '-detailed-exitcode'
+
+          - name: apply-changes-k8s-configuration
+            depends: check-changes-k8s-configuration.Succeeded
+            when: '{{tasks.check-changes-k8s-configuration.outputs.parameters.terragrunt_exit_code}} == 2'
+            templateRef:
+              name: run-terragrunt
+              template: run-terragrunt
+            arguments:
+              parameters:
+                - name: action
+                  value: apply
+                - name: workingDir
+                  value: '{{workflow.parameters.environment}}/k8s-cluster'
+                - name: terraform_source_module_path
+                  value: k8s-cluster
+                - name: extra_args
+                  value: '--auto-approve'
+
+          - name: check-k8s-cluster-status-and-get-kubeconfig
+            depends: check-changes-k8s-configuration.Succeeded
+            template: check-k8s-cluster-status-and-get-kubeconfig
+
+          - name: check-changes-external-secrets-configuration
+            depends: check-k8s-cluster-status-and-get-kubeconfig.Succeeded
+            templateRef:
+              name: run-terragrunt
+              template: run-terragrunt
+            arguments:
+              parameters:
+                - name: action
+                  value: plan
+                - name: workingDir
+                  value: '{{workflow.parameters.environment}}/cluster-configuration/external-secrets-operator'
+                - name: terraform_source_module_path
+                  value: cluster-configuration/external-secrets-operator
+                - name: extra_args
+                  value: |
+                    -var="kube_config_path=/kube/config" \
+                    --feature="state_path_prefix=do-k8s"
+
+          - name: apply-changes-external-secrets-configuration
+            depends: check-changes-external-secrets-configuration.Succeeded
+            when: '{{tasks.check-changes-external-secrets-configuration.outputs.parameters.terragrunt_exit_code}} == 2'
+            templateRef:
+              name: run-terragrunt
+              template: run-terragrunt
+            arguments:
+              parameters:
+                - name: action
+                  value: plan
+                - name: workingDir
+                  value: '{{workflow.parameters.environment}}/cluster-configuration/external-secrets-operator'
+                - name: terraform_source_module_path
+                  value: cluster-configuration/external-secrets-operator
+                - name: extra_args
+                  #value: '--auto-approve --feature="state_path_prefix=do-k8s"'
+                  value: |
+                    -var="kube_config_path=/kube/config" \
+                    --feature="state_path_prefix=do-k8s"
+
+    - name: check-k8s-cluster-status-and-get-kubeconfig
+      script:
+        image: digitalocean/doctl:1.148.0
+        volumeMounts:
+          - name: workflow-data
+            mountPath: /kube
+        env:
+          - name: DIGITALOCEAN_ACCESS_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: leonomano-do-k8s-cluster-minikube-do-token
+                key: token
+          - name: KUBECONFIG
+            value: /kube/config
+        command: [bash, -c]
+        source: |
+          set -e
+
+          export PATH="/app:$PATH"
+          echo "KUBECONFIG=$KUBECONFIG"
+          CLUSTER_NAME="dev-leonomano-projects"
+
+          echo "Waiting for cluster to be running..."
+          for i in $(seq 1 15); do
+            STATUS="$(doctl kubernetes cluster get "$CLUSTER_NAME" --format Status --no-header 2>/dev/null || true)"
+            [ -z "$STATUS" ] && STATUS="unknown"
+            echo "[$i] status=$STATUS"
+
+
+            if [ "$STATUS" = "running" ]; then
+              echo "Cluster is ready"
+              doctl kubernetes cluster kubeconfig save "$CLUSTER_NAME"
+              ls -hal $KUBECONFIG
+              echo "kubeconfig written to: $KUBECONFIG (or default, depending on doctl)"
+              exit 0
+            fi
+
+            if [ "$STATUS" = "error" ]; then
+              echo "Cluster entered ERROR state"
+              exit 1
+            fi
+
+            sleep 30
+          done
+
+          echo "Timeout waiting for cluster"
+          exit 1
+
+    - name: exit-handler
+      steps:
+        - - name: upload-terraform-provider-cache
+            templateRef:
+              name: run-terragrunt
+              template: upload-terraform-provider-cache
