@@ -4,7 +4,7 @@ metadata:
   generateName: deploy-do-kube-cluster-
   namespace: argo
   annotations:
-    workflows.argoproj.io/title: '**Bootstrap and Provision Kubernetes Cluster**'
+    workflows.argoproj.io/title: "**Bootstrap and Provision Kubernetes Cluster**"
     workflows.argoproj.io/description: |
       With this workflow you create a Kubernetes Cluster in Digital Ocean
       and provision it with the following kube tools:
@@ -15,13 +15,16 @@ metadata:
 spec:
   entrypoint: deploy-do-kube-cluster
   onExit: exit-handler
-  ttlStrategy:
-    secondsAfterCompletion: 300
+  volumes:
+    - name: doks-kubeconfig
+      secret:
+        secretName: doks-kubeconfig
+        optional: true
   volumeClaimTemplates:
     - metadata:
         name: terraform-provider-cache
       spec:
-        accessModes: ['ReadWriteOnce']
+        accessModes: ["ReadWriteOnce"]
         resources:
           requests:
             storage: 2Gi
@@ -29,15 +32,24 @@ spec:
     - metadata:
         name: workflow-data
       spec:
-        accessModes: ['ReadWriteOnce']
+        accessModes: ["ReadWriteOnce"]
         resources:
           requests:
             storage: 500Mi
         storageClassName: standard
   arguments:
     parameters:
+      - name: debug
+        value: "false"
+        enum:
+          - "true"
+          - "false"
       - name: environment
         value: dev
+      # TEMPORARY: 120s so the reuse/expiry behavior of rotate-doks-kubeconfig
+      # can be tested quickly. Switch to "1296000" (15 days) once validated.
+      - name: kubeconfig_expiry_seconds
+        value: "120"
       - name: terragrunt_branch
         value: main
       - name: terragrunt_commit
@@ -47,10 +59,10 @@ spec:
       - name: terraform_commit
         value: latest
       - name: tg_no_color
-        value: 'true'
+        value: "true"
         enum:
-          - 'true'
-          - 'false'
+          - "true"
+          - "false"
       - name: tg_log_level
         value: INFO
         enum:
@@ -59,6 +71,8 @@ spec:
           - INFO
           - DEBUG
           - TRACE
+      - name: kubeconfig_path
+        value: /.kube/doks.config
   templates:
     - name: deploy-do-kube-cluster
       dag:
@@ -78,15 +92,15 @@ spec:
                 - name: action
                   value: plan
                 - name: workingDir
-                  value: '{{workflow.parameters.environment}}/k8s-cluster'
+                  value: "{{workflow.parameters.environment}}/k8s-cluster"
                 - name: terraform_source_module_path
                   value: k8s-cluster
                 - name: extra_args
-                  value: '-detailed-exitcode'
+                  value: "-detailed-exitcode"
 
           - name: apply-changes-k8s-configuration
             depends: check-changes-k8s-configuration.Succeeded
-            when: '{{tasks.check-changes-k8s-configuration.outputs.parameters.terragrunt_exit_code}} == 2'
+            when: "{{tasks.check-changes-k8s-configuration.outputs.parameters.terragrunt_exit_code}} == 2"
             templateRef:
               name: run-terragrunt
               template: run-terragrunt
@@ -95,18 +109,38 @@ spec:
                 - name: action
                   value: apply
                 - name: workingDir
-                  value: '{{workflow.parameters.environment}}/k8s-cluster'
+                  value: "{{workflow.parameters.environment}}/k8s-cluster"
                 - name: terraform_source_module_path
                   value: k8s-cluster
                 - name: extra_args
-                  value: '--auto-approve'
+                  value: "--auto-approve"
+
+          # - name: check-k8s-cluster-status-and-get-kubeconfig
+          #   depends: check-changes-k8s-configuration.Succeeded
+          #   template: check-k8s-cluster-status-and-get-kubeconfig
 
           - name: check-k8s-cluster-status-and-get-kubeconfig
             depends: check-changes-k8s-configuration.Succeeded
-            template: check-k8s-cluster-status-and-get-kubeconfig
+            templateRef:
+              name: rotate-doks-kubeconfig
+              template: rotate
+            arguments:
+              parameters:
+                - name: cluster_name
+                  value: dev-leonomano-projects
+                - name: kubeconfig_path
+                  value: "{{workflow.parameters.kubeconfig_path}}"
+
+          - name: debug-kubeconfig
+            depends: check-k8s-cluster-status-and-get-kubeconfig.Succeeded
+            when: "{{workflow.parameters.debug}} == true"
+            template: debug-kubeconfig
 
           - name: check-changes-external-secrets-configuration
-            depends: check-k8s-cluster-status-and-get-kubeconfig.Succeeded
+            depends: >
+              check-k8s-cluster-status-and-get-kubeconfig.Succeeded &&
+              (apply-changes-k8s-configuration.Succeeded || apply-changes-k8s-configuration.Skipped) &&
+              (debug-kubeconfig.Succeeded || debug-kubeconfig.Skipped)
             templateRef:
               name: run-terragrunt
               template: run-terragrunt
@@ -115,17 +149,43 @@ spec:
                 - name: action
                   value: plan
                 - name: workingDir
-                  value: '{{workflow.parameters.environment}}/cluster-configuration/external-secrets-operator'
+                  value: "{{workflow.parameters.environment}}/cluster-configuration/external-secrets-operator"
                 - name: terraform_source_module_path
                   value: cluster-configuration/external-secrets-operator
                 - name: extra_args
                   value: |
-                    -var="kube_config_path=/kube/config" \
-                    --feature="state_path_prefix=do-k8s"
+                    -detailed-exitcode \
+                    --feature="state_path_prefix=do-k8s" \
+                    --feature="kube_ctx={{tasks.check-k8s-cluster-status-and-get-kubeconfig.outputs.parameters.kube_ctx}}" \
+                    --feature="kube_config_path={{workflow.parameters.kubeconfig_path}}"
 
           - name: apply-changes-external-secrets-configuration
             depends: check-changes-external-secrets-configuration.Succeeded
-            when: '{{tasks.check-changes-external-secrets-configuration.outputs.parameters.terragrunt_exit_code}} == 2'
+            when: "{{tasks.check-changes-external-secrets-configuration.outputs.parameters.terragrunt_exit_code}} == 2"
+            templateRef:
+              name: run-terragrunt
+              template: run-terragrunt
+            arguments:
+              parameters:
+                - name: action
+                  value: apply
+                - name: workingDir
+                  value: "{{workflow.parameters.environment}}/cluster-configuration/external-secrets-operator"
+                - name: terraform_source_module_path
+                  value: cluster-configuration/external-secrets-operator
+                - name: extra_args
+                  value: |
+                    --auto-approve \
+                    --feature="state_path_prefix=do-k8s" \
+                    --feature="kube_ctx={{tasks.check-k8s-cluster-status-and-get-kubeconfig.outputs.parameters.kube_ctx}}" \
+                    --feature="kube_config_path={{workflow.parameters.kubeconfig_path}}"
+
+          # cert-manager depends on ESO's ClusterSecretStore + CRDs already existing
+          # (its ExternalSecret for the Cloudflare token references them).
+          - name: check-changes-cert-manager-configuration
+            depends: >
+              apply-changes-external-secrets-configuration.Succeeded ||
+              apply-changes-external-secrets-configuration.Skipped
             templateRef:
               name: run-terragrunt
               template: run-terragrunt
@@ -134,62 +194,159 @@ spec:
                 - name: action
                   value: plan
                 - name: workingDir
-                  value: '{{workflow.parameters.environment}}/cluster-configuration/external-secrets-operator'
+                  value: "{{workflow.parameters.environment}}/cluster-configuration/cert-manager"
                 - name: terraform_source_module_path
-                  value: cluster-configuration/external-secrets-operator
+                  value: cluster-configuration/cert-manager
                 - name: extra_args
-                  #value: '--auto-approve --feature="state_path_prefix=do-k8s"'
                   value: |
-                    -var="kube_config_path=/kube/config" \
-                    --feature="state_path_prefix=do-k8s"
+                    -detailed-exitcode \
+                    --feature="state_path_prefix=do-k8s" \
+                    --feature="kube_ctx={{tasks.check-k8s-cluster-status-and-get-kubeconfig.outputs.parameters.kube_ctx}}" \
+                    --feature="kube_config_path={{workflow.parameters.kubeconfig_path}}"
 
-    - name: check-k8s-cluster-status-and-get-kubeconfig
+          - name: apply-changes-cert-manager-configuration
+            depends: check-changes-cert-manager-configuration.Succeeded
+            when: "{{tasks.check-changes-cert-manager-configuration.outputs.parameters.terragrunt_exit_code}} == 2"
+            templateRef:
+              name: run-terragrunt
+              template: run-terragrunt
+            arguments:
+              parameters:
+                - name: action
+                  value: apply
+                - name: workingDir
+                  value: "{{workflow.parameters.environment}}/cluster-configuration/cert-manager"
+                - name: terraform_source_module_path
+                  value: cluster-configuration/cert-manager
+                - name: extra_args
+                  value: |
+                    --auto-approve \
+                    --feature="state_path_prefix=do-k8s" \
+                    --feature="kube_ctx={{tasks.check-k8s-cluster-status-and-get-kubeconfig.outputs.parameters.kube_ctx}}" \
+                    --feature="kube_config_path={{workflow.parameters.kubeconfig_path}}"
+
+          # Traefik depends on cert-manager's "letsencrypt-staging" ClusterIssuer
+          # already existing (its Certificate resource references it by name).
+          - name: check-changes-traefik-configuration
+            depends: >
+              apply-changes-cert-manager-configuration.Succeeded ||
+              apply-changes-cert-manager-configuration.Skipped
+            templateRef:
+              name: run-terragrunt
+              template: run-terragrunt
+            arguments:
+              parameters:
+                - name: action
+                  value: plan
+                - name: workingDir
+                  value: "{{workflow.parameters.environment}}/cluster-configuration/traefik"
+                - name: terraform_source_module_path
+                  value: cluster-configuration/traefik
+                - name: extra_args
+                  value: |
+                    -detailed-exitcode \
+                    --feature="state_path_prefix=do-k8s" \
+                    --feature="kube_ctx={{tasks.check-k8s-cluster-status-and-get-kubeconfig.outputs.parameters.kube_ctx}}" \
+                    --feature="kube_config_path={{workflow.parameters.kubeconfig_path}}"
+
+          - name: apply-changes-traefik-configuration
+            depends: check-changes-traefik-configuration.Succeeded
+            when: "{{tasks.check-changes-traefik-configuration.outputs.parameters.terragrunt_exit_code}} == 2"
+            templateRef:
+              name: run-terragrunt
+              template: run-terragrunt
+            arguments:
+              parameters:
+                - name: action
+                  value: apply
+                - name: workingDir
+                  value: "{{workflow.parameters.environment}}/cluster-configuration/traefik"
+                - name: terraform_source_module_path
+                  value: cluster-configuration/traefik
+                - name: extra_args
+                  value: |
+                    --auto-approve \
+                    --feature="state_path_prefix=do-k8s" \
+                    --feature="kube_ctx={{tasks.check-k8s-cluster-status-and-get-kubeconfig.outputs.parameters.kube_ctx}}" \
+                    --feature="kube_config_path={{workflow.parameters.kubeconfig_path}}"
+
+    - name: debug-kubeconfig
       script:
-        image: digitalocean/doctl:1.148.0
+        image: bitnami/kubectl:latest
         volumeMounts:
           - name: workflow-data
-            mountPath: /kube
+            mountPath: /.kube
+            readOnly: true
         env:
-          - name: DIGITALOCEAN_ACCESS_TOKEN
-            valueFrom:
-              secretKeyRef:
-                name: leonomano-do-k8s-cluster-minikube-do-token
-                key: token
           - name: KUBECONFIG
-            value: /kube/config
+            value: "{{workflow.parameters.kubeconfig_path}}"
         command: [bash, -c]
         source: |
           set -e
-
-          export PATH="/app:$PATH"
           echo "KUBECONFIG=$KUBECONFIG"
-          CLUSTER_NAME="dev-leonomano-projects"
+          [[ -f "$KUBECONFIG" ]] && cat "$KUBECONFIG" || echo "$KUBECONFIG does not exist"
+          kubectl get nodes
 
-          echo "Waiting for cluster to be running..."
-          for i in $(seq 1 15); do
-            STATUS="$(doctl kubernetes cluster get "$CLUSTER_NAME" --format Status --no-header 2>/dev/null || true)"
-            [ -z "$STATUS" ] && STATUS="unknown"
-            echo "[$i] status=$STATUS"
-
-
-            if [ "$STATUS" = "running" ]; then
-              echo "Cluster is ready"
-              doctl kubernetes cluster kubeconfig save "$CLUSTER_NAME"
-              ls -hal $KUBECONFIG
-              echo "kubeconfig written to: $KUBECONFIG (or default, depending on doctl)"
-              exit 0
-            fi
-
-            if [ "$STATUS" = "error" ]; then
-              echo "Cluster entered ERROR state"
-              exit 1
-            fi
-
-            sleep 30
-          done
-
-          echo "Timeout waiting for cluster"
-          exit 1
+    #- name: check-k8s-cluster-status-and-get-kubeconfig
+    #  script:
+    #    image: digitalocean/doctl:1.148.0
+    #    volumeMounts:
+    #      - name: workflow-data
+    #        mountPath: /kube
+    #    env:
+    #      - name: DIGITALOCEAN_ACCESS_TOKEN
+    #        valueFrom:
+    #          secretKeyRef:
+    #            name: leonomano-do-k8s-cluster-minikube-do-token
+    #            key: token
+    #      - name: KUBECONFIG
+    #        value: /kube/config
+    #    command: [bash, -c]
+    #    source: |
+    #      set -e
+    #
+    #      export PATH="/app:$PATH"
+    #      echo "KUBECONFIG=$KUBECONFIG"
+    #      CLUSTER_NAME="dev-leonomano-projects"
+    #
+    #      echo "Waiting for cluster to be running..."
+    #      for i in $(seq 1 15); do
+    #        STATUS="$(doctl kubernetes cluster get "$CLUSTER_NAME" --format Status --no-header 2>/dev/null || true)"
+    #        [ -z "$STATUS" ] && STATUS="unknown"
+    #        echo "[$i] status=$STATUS"
+    #
+    #        if [ "$STATUS" = "running" ]; then
+    #          echo "Cluster is READY!!"
+    #          mkdir -p "$(dirname "$KUBECONFIG")"
+    #          doctl kubernetes cluster kubeconfig show \
+    #            --expiry-seconds "{{workflow.parameters.kubeconfig_expiry_seconds}}" \
+    #            "$CLUSTER_NAME" > "$KUBECONFIG"
+    #          if [ -f "$KUBECONFIG" ]; then
+    #            if [ {{workflow.parameters.debug}} == "true" ]; then
+    #              echo "Kubeconfig content:"
+    #              cat "$KUBECONFIG"
+    #            fi
+    #            ls -hal $KUBECONFIG
+    #            chmod 644 $KUBECONFIG
+    #            ls -hal $KUBECONFIG
+    #            echo "kubeconfig written to: $KUBECONFIG (or default, depending on doctl)"
+    #            exit 0
+    #          else
+    #            echo "Failed to write kubeconfig to $KUBECONFIG"
+    #            exit 1
+    #          fi
+    #        fi
+    #
+    #        if [ "$STATUS" = "error" ]; then
+    #          echo "Cluster entered ERROR state"
+    #          exit 1
+    #        fi
+    #
+    #        sleep 30
+    #      done
+    #
+    #      echo "Timeout waiting for cluster"
+    #      exit 1
 
     - name: exit-handler
       steps:

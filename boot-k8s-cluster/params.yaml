@@ -1,0 +1,6 @@
+environment: dev
+terragrunt_branch: feature-cluster-setup
+terragrunt_commit: latest
+terraform_branch: feature-cluster-setup
+terraform_commit: latest
+debug: "true"

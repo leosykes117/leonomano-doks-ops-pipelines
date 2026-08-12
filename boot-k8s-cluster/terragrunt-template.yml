@@ -4,7 +4,7 @@ metadata:
   name: run-terragrunt
   namespace: argo
   annotations:
-    workflows.argoproj.io/title: '**Execute Terragrunt Commands**'
+    workflows.argoproj.io/title: "**Execute Terragrunt Commands**"
     workflows.argoproj.io/description: |
       With this workflow you can run terragrunt
 spec:
@@ -17,7 +17,7 @@ spec:
             enum: [plan, apply, destroy]
           - name: workingDir
           - name: extra_args
-            value: ''
+            value: ""
           - name: terraform_source_module_path
         artifacts:
           - name: terragrunt-repo
@@ -34,12 +34,14 @@ spec:
             valueFrom:
               path: /tmp/terragrunt_exitcode.txt
       script:
-        image: alpine/terragrunt
+        image: alpine/terragrunt:latest
+        imagePullPolicy: IfNotPresent
         volumeMounts:
           - name: terraform-provider-cache
             mountPath: /tmp/terraform/providers
           - name: workflow-data
-            mountPath: /kube
+            mountPath: /.kube
+            readOnly: true
         env:
           - name: AWS_ACCESS_KEY_ID
             valueFrom:
@@ -54,7 +56,7 @@ spec:
           - name: AWS_REGION
             value: us-east-1
           - name: KUBECONFIG
-            value: /kube/config
+            value: "{{workflow.parameters.kubeconfig_path}}"
         workingDir: /repo/{{inputs.parameters.workingDir}}
         command:
           - bash
@@ -72,6 +74,9 @@ spec:
           exitcode=$?
           echo "Terragrunt {{inputs.parameters.action}} exit code: $exitcode"
           echo $exitcode > /tmp/terragrunt_exitcode.txt
+          if [ $exitcode -eq 1 ]; then
+            exit 1
+          fi
 
     - name: download-terraform-provider-cache
       inputs:
@@ -84,7 +89,7 @@ spec:
               none: {}
       script:
         image: alpine:3.23
-        command: ['sh', '-c']
+        command: ["sh", "-c"]
         volumeMounts:
           - name: terraform-provider-cache
             mountPath: /tmp/terraform/providers
@@ -109,7 +114,7 @@ spec:
               none: {}
       script:
         image: alpine:3.23
-        command: ['sh', '-c']
+        command: ["sh", "-c"]
         volumeMounts:
           - name: terraform-provider-cache
             mountPath: /tmp/terraform/providers
